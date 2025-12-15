@@ -1,12 +1,11 @@
-# ============================================================================
-# Factors: Earnings Persistence, Dividend Yield, Idiosyncratic Skewness
-# ============================================================================
 
 #################################################################################
 ### 1. Libraries ------------------------------------------------------------ ###
 #################################################################################
 setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 getwd()
+
+blpConnect()
 
 required_pkgs <- c(
   "tidyverse", "purrr", "dplyr", "stats", "moments", "knitr", "tidyr", "forcats", "ggplot2", "Rblpapi", 
@@ -144,7 +143,7 @@ countries <- c(
 
 bdh_list <- bdh(
   securities = msci_tickers,
-  fields     = c("PX_LAST", "IN001","IN004" ),
+  fields     = c("PX_LAST", "IN001", "IN004", "IN113"), # Added Field
   start.date = Sys.Date() - years(40),
   end.date   = Sys.Date(),
   options = c("periodicitySelection" = "MONTHLY")
@@ -155,7 +154,8 @@ bdh_list <- map(bdh_list, ~ {
   if (is.data.frame(.x)) {
     rename(.x,
            EPS = IN001,
-           PE  = IN004
+           PE  = IN004,
+           Fwd_PE = IN113  # Renaming the new field
     )
   } else .x
 })
@@ -440,3 +440,109 @@ ggplot(valuation_gap_df) +
     strip.text = element_text(face = "bold", size = 11, color = "white"),
     strip.background = element_rect(fill = "#5D6D7E", color = NA)
   )
+
+
+################################################################################
+### 6. Forward P/E (1Y Est) vs Current TTM P/E Analysis -------------------- ###
+################################################################################
+
+# 1. Calculation Function for Fwd vs TTM
+fwd_comparison_df <- imap_dfr(bdh_list, ~ {
+  df      <- .x
+  ticker  <- .y
+  
+  country_name <- ifelse(!is.null(ticker_map[[ticker]]), ticker_map[[ticker]], ticker)
+  
+  # Check if required columns exist
+  if (!is.data.frame(df) || !all(c("PE", "Fwd_PE") %in% names(df))) return(NULL)
+  
+  # Get the latest non-NA value for Current PE
+  current_pe <- tail(na.omit(df$PE), 1)
+  
+  # Get the latest non-NA value for Forward PE
+  fwd_pe <- tail(na.omit(df$Fwd_PE), 1)
+  
+  if (length(current_pe) == 0 || length(fwd_pe) == 0) return(NULL)
+  
+  tibble(
+    Country    = country_name,
+    Current_PE = current_pe,
+    Fwd_PE     = fwd_pe,
+    # Calculate implied earnings growth impact (Discount/Premium)
+    # Negative value implies Fwd PE < Current PE (Expected Growth)
+    Diff       = (fwd_pe / current_pe) - 1 
+  )
+})
+
+# 2. Preparation for Plotting
+fwd_comparison_df <- fwd_comparison_df %>%
+  mutate(
+    # Assign Region (Using the function defined in Section 5)
+    Region = get_region(Country),
+    
+    # Reorder Country by Current_PE for consistent sorting
+    Country = fct_reorder(Country, Current_PE),
+    
+    # Determine Status for coloring
+    # If Fwd PE < Current PE, the market expects earnings to grow (Multiple compresses)
+    Valuation_Direction = ifelse(Fwd_PE < Current_PE, "Compression (Growth)", "Expansion (Contraction)")
+  )
+
+# 3. Dumbbell Plot: TTM vs 1Y Forward
+ggplot(fwd_comparison_df) +
+  # Draw the connecting line
+  geom_segment(
+    aes(y = Country, yend = Country, x = Current_PE, xend = Fwd_PE, color = Valuation_Direction),
+    size = 1.5
+  ) +
+  # Point for Current PE
+  geom_point(
+    aes(x = Current_PE, y = Country, color = "Current TTM"), 
+    size = 3.5
+  ) +
+  # Point for Forward PE
+  geom_point(
+    aes(x = Fwd_PE, y = Country, color = "1Y Forward"), 
+    size = 3.5
+  ) +
+  # Regional Facetting
+  facet_grid(Region ~ ., scales = "free_y", space = "free_y") +
+  
+  # Colors
+  scale_color_manual(
+    values = c(
+      "Current TTM"             = "#377eb8",    # Blue
+      "1Y Forward"              = "#E69F00",    # Orange/Gold
+      "Compression (Growth)"    = "#009E73",    # Green line (Good)
+      "Expansion (Contraction)" = "#e41a1c"     # Red line (Bad/Warning)
+    ),
+    breaks = c("Current TTM", "1Y Forward", "Compression (Growth)", "Expansion (Contraction)"),
+    name = NULL 
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linetype = c(0, 0, 1, 1), 
+        shape    = c(16, 16, NA, NA)
+      )
+    )
+  ) +
+  labs(
+    title = "Valuation Outlook: Current TTM vs. 1Y Forward P/E",
+    subtitle = "Comparing TTM P/E against consensus forward estimates",
+    x = "P/E Ratio",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom", 
+    legend.box.margin = margin(t = 10),
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 9, face = "bold"),
+    
+    # Facet Styling
+    panel.border = element_rect(color = "grey90", fill = NA),
+    strip.text = element_text(face = "bold", size = 11, color = "white"),
+    strip.background = element_rect(fill = "#5D6D7E", color = NA)
+  )
+
